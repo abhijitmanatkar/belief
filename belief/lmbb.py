@@ -1,24 +1,3 @@
-from z3 import *
-from transformers import T5Tokenizer, T5ForConditionalGeneration
-import numpy as np
-import torch
-import string
-from dataclasses import dataclass
-from collections import defaultdict
-from enum import Enum
-from typing import List, Dict
-import copy
-import json
-import logging
-import random
-from belief.utils import get_raw_input, get_scores
-
-WEIGHT_PRECISION = 3
-
-class FeedbackType(Enum):
-    RELEVANT = 0
-    ON_TOPIC_RANDOM = 1
-
 class Predicate():
     """A predicate is a generalized sentence which can be substituted with entities.
     Example 'IsA,dog' is a predicate in which if we substitute the entity 'poodle',
@@ -85,7 +64,7 @@ class Proposition():
         if self.predicate.relation == "HasPart":
             return f"A {self.predicate.object} is part of a {self.subject}."
         if self.predicate.relation == "HasProperty":
-            return f"{self.subject} has the property of being {self.object}."
+            return f"{self.subject} has the property of being {self.predicate.object}."
 
     def get_nl_question(self):
         """Returns natural language sentence asking the proposition"""
@@ -100,7 +79,7 @@ class Proposition():
         if self.predicate.relation == "HasPart":
             return f"Is a {self.predicate.object} part of a {self.subject}?"
         if self.predicate.relation == "HasProperty":
-            return f"Does {self.subject} have the property of being {self.object}?"
+            return f"Does {self.subject} have the property of being {self.predicate.object}?"
 
 class Constraint():
     """Class for constraint
@@ -246,9 +225,7 @@ class LMBB():
         options = ['yes', 'no']
         
         raw_input = get_raw_input(question, options)
-        logging.debug(raw_input)
         scores = get_scores(self.model, self.tokenizer, raw_input, options)
-        logging.debug(scores)
         answer = max(scores, key=lambda x: x[1])
 
         return Proposition(
@@ -289,6 +266,9 @@ class LMBB():
             for subject in subjects:
                 src_sent = constraint.src_predicate.substitute(subject)
                 dest_sent = constraint.dest_predicate.substitute(subject)
+
+                if (src_sent not in self.beliefs) or (dest_sent not in self.beliefs):
+                    continue
 
                 src_bool = belief_bools[src_sent] if src_sent in belief_bools else Bool(src_sent)
                 dest_bool = belief_bools[dest_sent] if dest_sent in belief_bools else Bool(dest_sent)
@@ -351,3 +331,53 @@ class LMBB():
                         dfs(constraint.dest_predicate, False)
 
         return clashing_beliefs
+
+    def calculate_consistency(self):
+        
+        violation_criteria = {
+            "yes_yes": (True, False),
+            "yes_no": (True, True),
+            "no_yes": (False, False),
+            "no_no": (False, True)
+        }
+
+        violated_constraints = 0
+        valid_constraints = 0
+
+        for src_sentence in self.beliefs:
+            src_prop = self.beliefs[src_sentence]
+            
+            for constraint in self.links[src_prop.predicate.str_rep]:    
+                dest_sentence = constraint.dest_predicate.substitute(src_prop.subject)
+
+                if (src_sentence in self.beliefs) and (dest_sentence in self.beliefs):
+                    valid_constraints += 1
+                    dest_prop = self.beliefs[dest_sentence]
+                    if (src_prop.boolean, dest_prop.boolean) == violation_criteria[constraint.implication]:
+                        violated_constraints += 1
+
+        if valid_constraints == 0:
+            return 0
+        return 1 - (violated_constraints/valid_constraints)
+
+    def calculate_f1(self, fact_props):
+        tp = 0
+        fp = 0
+        fn = 0
+        tn = 0
+        for prop in fact_props:
+            prediction = self.beliefs[prop.sentence].boolean
+            label = prop.boolean
+            if prediction == True and label == True:
+                tp += 1
+            elif prediction == True and label == False:
+                fp += 1
+            elif prediction == False and label == True:
+                fn += 1
+            else:
+                tn += 1
+
+        precision = tp / (tp + fp)
+        recall = tp / (tp + fn)
+
+        return 2*precision*recall / (precision + recall)
