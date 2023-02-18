@@ -1,3 +1,22 @@
+from z3 import *
+from transformers import T5Tokenizer, T5ForConditionalGeneration
+import numpy as np
+import torch
+import string
+from dataclasses import dataclass
+from collections import defaultdict
+from enum import Enum
+from typing import List, Dict
+import copy
+import json
+import random
+
+WEIGHT_PRECISION = 3
+
+class FeedbackType(Enum):
+    RELEVANT = 0
+    ON_TOPIC_RANDOM = 1
+
 class Predicate():
     """A predicate is a generalized sentence which can be substituted with entities.
     Example 'IsA,dog' is a predicate in which if we substitute the entity 'poodle',
@@ -102,36 +121,66 @@ class Constraint():
         self.dest_predicate = dest_predicate
         self.weight = int(round(weight * (10**WEIGHT_PRECISION), WEIGHT_PRECISION))
         self.implication = implication
-
+    
     @classmethod
-    def from_raw(cls, raw_link):
+    def from_raw(cls, raw_link, forward_weight=None, backward_weight=None):
+        
         if raw_link['direction'] == 'forward':
             src_predicate = raw_link['source']
             dest_predicate = raw_link['target']
+            if forward_weight is not None:
+                weight = forward_weight
+            else:
+                weight = raw_link['score']
+        
         elif raw_link['direction'] == 'back':
             src_predicate = raw_link['target']
             dest_predicate = raw_link['source']
+            if backward_weight is not None:
+                weight = backward_weight
+            else:
+                weight = raw_link['score']
 
         return Constraint(
             src_predicate=Predicate(src_predicate),
             dest_predicate=Predicate(dest_predicate),
-            weight=raw_link['score'],
+            weight=weight,
             implication=raw_link['weight']
         )
-
+    
     def __repr__(self):
         s, d = self.implication.split('_')
-        return f"Constraint(<{'¬' if s == 'no' else ''}{self.src_predicate.str_rep} ⟶ {'¬' if d == 'no' else ''}{self.dest_predicate.str_rep}>, {self.weight / {10**WEIGHT_PRECISION}})"
+        return f"Constraint(<{'¬' if s == 'no' else ''}{self.src_predicate.str_rep} ⟶ {'¬' if d == 'no' else ''}{self.dest_predicate.str_rep}>, {self.weight / (10**WEIGHT_PRECISION)})"
 
 
+def get_scores(model, tokenizer, raw_input, output_options):
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    output_scores = []
+    with torch.no_grad():
+        input_ids = tokenizer.encode(raw_input, return_tensors="pt")
+        input_ids = input_ids.to(device)
+        for option in output_options:
+            output_ids = tokenizer.encode(option, return_tensors="pt")
+            output_ids = output_ids.to(device)
+            res = model(input_ids, labels=output_ids, return_dict=True)
+            score = torch.exp(-res.loss)
+            output_scores.append((option, score.to('cpu').detach().numpy()))
+    return output_scores
+
+def get_raw_input(question, options):
+    raw_input = question + ' \n'
+    for option_num, option in zip(list(string.ascii_uppercase), options):
+        raw_input += f' ({option_num}) {option}'
+    return raw_input
+    
 class LMBB():
     """Langauge Model + Belief Bank"""
 
-    def __init__(self, model, tokenizer, raw_constraints):
+    def __init__(self, model, tokenizer, raw_constraints, forward_weight=None, backward_weight=None):
         self.model = model
         self.tokenizer = tokenizer
         
-        self.constraints = [Constraint.from_raw(c) for c in raw_constraints]
+        self.constraints = [Constraint.from_raw(c, forward_weight, backward_weight) for c in raw_constraints]
         self.links: Dict[str, List[Constraint]] = defaultdict(list)
         for constraint in self.constraints:
             self.links[constraint.src_predicate.str_rep].append(constraint)
@@ -142,7 +191,27 @@ class LMBB():
         # Feedback config
         self.num_random_on_topic_beliefs = 3
         self.num_relevant_beliefs = 3
+        
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.model.to(self.device)
+        
+        self.DEBUG = False
 
+    def printdebug(self, *args):
+        if self.DEBUG:
+            print(*args)
+            
+    def beliefdiff(self, beliefs1, beliefs2):
+        "Returns a list of beliefs that have different truth values in beliefs1 and beliefs2"
+        changed = []
+        
+        for sent in beliefs1:
+            if sent in beliefs2:
+                if beliefs1[sent].boolean != beliefs2[sent].boolean:
+                    changed.append((sent, beliefs1[sent].boolean, beliefs2[sent].boolean))
+        
+        return changed
+        
     def get_beliefs_by_subject(self, subject):
         subject_beliefs = [self.beliefs[key] for key in self.beliefs.keys() if key.split(",")[0] == subject]
         return subject_beliefs
@@ -167,11 +236,9 @@ class LMBB():
 
         # Optional constraint solving
         if constraint_solving:
-            beliefs = list(self.beliefs.values())
-            beliefs.append(proposition)
-            new_beliefs = self.maxSat(beliefs)
+            new_beliefs = self.maxSat(self.beliefs, {proposition.sentence: proposition})
         else:
-            new_beliefs = [proposition]
+            new_beliefs = {proposition.sentence: proposition}
         self.set_beliefs(new_beliefs)
 
     def add_belief_set(
@@ -188,22 +255,20 @@ class LMBB():
             with_feedback: Whether to use feedback or not
             feedback_type: RELEVANT / ON_TOPIC_RANDOM
         """
-        propositions = [self.query(proposition, with_feedback, feedback_type) for proposition in propositions]
+        propositions = {proposition.sentence:self.query(proposition, with_feedback, feedback_type) for proposition in propositions}
         
         # Optional constraint solving
         if constraint_solving:
-            beliefs = list(self.beliefs.values())
-            beliefs += propositions
-            new_beliefs = self.maxSat(beliefs)
+            new_beliefs = self.maxSat(self.beliefs, propositions)
         else:
             new_beliefs = propositions
         self.set_beliefs(new_beliefs)
 
     def set_beliefs(self, new_beliefs):
-        for belief in new_beliefs:
-            self.beliefs[belief.sentence] = belief
+        for sentence in new_beliefs:
+            self.beliefs[sentence] = new_beliefs[sentence]
 
-    def query(self, proposition: Proposition, with_feedback=True, feedback_type=FeedbackType.RELEVANT):
+    def query(self, proposition: Proposition, with_feedback=True, feedback_type=FeedbackType.RELEVANT) -> Proposition:
         """
         Args:
             proposition: the query to the LMBB system
@@ -235,11 +300,12 @@ class LMBB():
             weight=answer[1]
         )
     
-    def maxSat(self, beliefs: List[Proposition]):
+    def maxSat(self, beliefs: Dict[str, Proposition], propositions: Dict[str, Proposition] = []):
         """Run MaxSAT solver considering 'beliefs' and constraints
         
         Args:
-            beliefs: List of propositions
+            beliefs: Dictiionary of (sentence,proposition) key-value pairs
+            propositions: New (sentence,proposition) key-value pairs
         
         Returns:
             new_beliefs: List of modified beliefs to ensure maximum satisfiability
@@ -250,10 +316,12 @@ class LMBB():
         belief_props = {}
         
         subjects = set()
-
-        for prop in beliefs:
+        
+        problem_constraints = []
+        
+        for sentence in beliefs:
+            prop = beliefs[sentence]
             subjects.add(prop.subject)
-            sentence = prop.sentence
             if sentence not in belief_bools:
                 belief_bools[sentence] = Bool(sentence)
                 belief_props[sentence] = prop
@@ -261,17 +329,45 @@ class LMBB():
                 optim.add_soft(belief_bools[sentence], prop.weight)
             else:
                 optim.add_soft(Not(belief_bools[sentence]), prop.weight)
-
+            problem_constraints.append(prop)
+                
+        for sentence in propositions:
+            prop = propositions[sentence]
+            subjects.add(prop.subject)
+            if sentence not in belief_bools:
+                belief_bools[sentence] = Bool(sentence)
+                belief_props[sentence] = prop
+            if prop.boolean == True:
+                optim.add_soft(belief_bools[sentence], prop.weight)
+            else:
+                optim.add_soft(Not(belief_bools[sentence]), prop.weight)
+            problem_constraints.append(prop)
+            
         for constraint in self.constraints:
             for subject in subjects:
                 src_sent = constraint.src_predicate.substitute(subject)
                 dest_sent = constraint.dest_predicate.substitute(subject)
 
-                if (src_sent not in self.beliefs) or (dest_sent not in self.beliefs):
+#                 if (src_sent not in self.beliefs) or (dest_sent not in self.beliefs):
+#                     continue
+                
+#                 if src_sent in belief_bools:
+#                     src_bool = belief_bools[src_sent]
+#                 else:
+#                     self.printdebug(f"Sentence not in initial beliefs: {src_sent}")
+#                     src_bool = belief_bools[src_sent] = Bool(src_sent)
+                    
+#                 if dest_sent in belief_bools:
+#                     dest_bool = belief_bools[dest_sent]
+#                 else:
+#                     self.printdebug(f"Sentence not in initial beliefs: {dest_sent}")
+#                     dest_bool = belief_bools[dest_sent] = Bool(dest_sent)
+                    
+                if (src_sent not in belief_bools) or (dest_sent not in belief_bools):
                     continue
-
-                src_bool = belief_bools[src_sent] if src_sent in belief_bools else Bool(src_sent)
-                dest_bool = belief_bools[dest_sent] if dest_sent in belief_bools else Bool(dest_sent)
+                
+                src_bool = belief_bools[src_sent]
+                dest_bool = belief_bools[dest_sent]
 
                 if constraint.implication == "yes_yes":
                     optim.add_soft(Implies(src_bool, dest_bool), constraint.weight)
@@ -281,16 +377,34 @@ class LMBB():
                     optim.add_soft(Implies(Not(src_bool), src_bool), constraint.weight)
                 elif constraint.implication == "no_no":
                     optim.add_soft(Implies(Not(src_bool), Not(dest_bool)), constraint.weight)
-
+                problem_constraints.append((subject, constraint))
+        
+        # self.printdebug("Problem Constraints:", problem_constraints)
+        
         optim.check()
         mod = optim.model()
 
         new_beliefs = copy.deepcopy(beliefs)
-        for prop in new_beliefs:
-            sentence = prop.sentence
-            prop.boolean = mod.evaluate(belief_bools[sentence])
+        for sentence in new_beliefs:
+            new_beliefs[sentence].boolean = bool(mod.evaluate(belief_bools[sentence]))
         
-        return new_beliefs
+        updated_propositions = copy.deepcopy(propositions)
+        for sentence in updated_propositions:
+            updated_propositions[sentence].boolean = bool(mod.evaluate(belief_bools[sentence]))
+        
+        changed_beliefs = self.beliefdiff(beliefs, new_beliefs)
+        changed_propositions = self.beliefdiff(propositions, updated_propositions)
+        
+        self.printdebug("Changed beliefs:", changed_beliefs)
+        self.printdebug("Changed propositions:", changed_propositions)
+        
+        combined_beliefs = {}
+        for sentence in new_beliefs:
+            combined_beliefs[sentence] = new_beliefs[sentence]
+        for sentence in updated_propositions:
+            combined_beliefs[sentence] = updated_propositions[sentence]
+        
+        return combined_beliefs
 
     def feedback(self, proposition: Proposition, feedback_type=FeedbackType.RELEVANT):
         """Returns feedback beliefs corresponding to the given proposition using one of multiple strategies."""
@@ -303,7 +417,10 @@ class LMBB():
             # Sorting according to descending order
             clashing_beliefs = sorted(self.get_clashing_beliefs(proposition), key=lambda prop: -prop.weight)
             if len(clashing_beliefs) < self.num_relevant_beliefs:
-                clashing_beliefs += list(self.beliefs.values())[:self.num_relevant_beliefs - len(clashing_beliefs)]
+                clashing_beliefs += random.sample(list(self.beliefs.values()), min(self.num_relevant_beliefs - len(clashing_beliefs), len(self.beliefs)))
+            # print("Proposition:", proposition)
+            # print("Clashing beliefs:", clashing_beliefs)
+            # print()
             return clashing_beliefs[:self.num_relevant_beliefs]
             
 
@@ -317,7 +434,7 @@ class LMBB():
         def dfs(predicate: Predicate, expected_truth: bool):
             visited_nodes.add(predicate.str_rep)
             sentence = predicate.substitute(subject)
-            if self.beliefs[sentence].boolean != expected_truth:
+            if sentence in self.beliefs and self.beliefs[sentence].boolean != expected_truth:
                 clashing_beliefs.append(self.beliefs[sentence])
             for constraint in self.links[predicate.str_rep]:
                 if not constraint.dest_predicate.str_rep in visited_nodes:
@@ -329,7 +446,20 @@ class LMBB():
                         dfs(constraint.dest_predicate, True)
                     elif constraint.implication == "no_no" and expected_truth == False:
                         dfs(constraint.dest_predicate, False)
-
+        
+        true_prop = copy.deepcopy(proposition)
+        true_prop.boolean = True
+        self.beliefs[true_prop.sentence] = true_prop
+        visited_nodes = set()
+        dfs(true_prop.predicate, True)
+        
+        false_prop = copy.deepcopy(proposition)
+        false_prop.boolean = False
+        self.beliefs[false_prop.sentence] = false_prop
+        visited_nodes = set()
+        dfs(false_prop.predicate, False)
+        del self.beliefs[false_prop.sentence]
+        
         return clashing_beliefs
 
     def calculate_consistency(self):
@@ -377,7 +507,7 @@ class LMBB():
             else:
                 tn += 1
 
-        precision = tp / (tp + fp)
-        recall = tp / (tp + fn)
+        precision = tp / (tp + fp + 1e-8)
+        recall = tp / (tp + fn + 1e-8)
 
-        return 2*precision*recall / (precision + recall)
+        return 2*precision*recall / (precision + recall + 1e-8)
