@@ -73,17 +73,35 @@ class Proposition():
     def get_nl_sentence(self):
         """Returns natural language sentence expressing the proposition"""
         if self.predicate.relation == 'IsA':
-            return f"{self.subject} is a {self.predicate.object}."
+            if self.boolean == True:
+                return f"{self.subject} is a {self.predicate.object}."
+            else:
+                return f"{self.subject} is not a {self.predicate.object}."
         if self.predicate.relation == "MadeOf":
-            return f"{self.subject} is made of {self.predicate.object}."
+            if self.boolean == True:
+                return f"{self.subject} is made of {self.predicate.object}."
+            else:
+                return f"{self.subject} is not made of {self.predicate.object}."
         if self.predicate.relation == "CapableOf":
-            return f"{self.subject} is capable of {self.predicate.object}."
+            if self.boolean == True:
+                return f"{self.subject} is capable of {self.predicate.object}."
+            else:
+                return f"{self.subject} is not capable of {self.predicate.object}."
         if self.predicate.relation == "HasA":
-            return f"{self.subject} has a {self.predicate.object}."
+            if self.boolean == True:
+                return f"{self.subject} has a {self.predicate.object}."
+            else:
+                return f"{self.subject} does not have a {self.predicate.object}."
         if self.predicate.relation == "HasPart":
-            return f"A {self.predicate.object} is part of a {self.subject}."
+            if self.boolean == True:
+                return f"A {self.predicate.object} is part of a {self.subject}."
+            else:
+                return f"A {self.predicate.object} is not part of a {self.subject}."
         if self.predicate.relation == "HasProperty":
-            return f"{self.subject} has the property of being {self.predicate.object}."
+            if self.boolean == True:
+                return f"{self.subject} has the property of being {self.predicate.object}."
+            else:
+                return f"{self.subject} does not have the property of being {self.predicate.object}."
 
     def get_nl_question(self):
         """Returns natural language sentence asking the proposition"""
@@ -417,7 +435,10 @@ class LMBB():
             # Sorting according to descending order
             clashing_beliefs = sorted(self.get_clashing_beliefs(proposition), key=lambda prop: -prop.weight)
             if len(clashing_beliefs) < self.num_relevant_beliefs:
-                clashing_beliefs += random.sample(list(self.beliefs.values()), min(self.num_relevant_beliefs - len(clashing_beliefs), len(self.beliefs)))
+                backup_beliefs = self.get_beliefs_by_subject(proposition.subject)
+                if len(backup_beliefs) < self.num_relevant_beliefs - len(clashing_beliefs):
+                    backup_beliefs += list(self.beliefs.values())
+                clashing_beliefs += random.sample(backup_beliefs, min(self.num_relevant_beliefs - len(clashing_beliefs), len(backup_beliefs)))
             # print("Proposition:", proposition)
             # print("Clashing beliefs:", clashing_beliefs)
             # print()
