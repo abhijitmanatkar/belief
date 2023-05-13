@@ -10,6 +10,11 @@ from typing import List, Dict
 import copy
 import json
 import random
+import json
+from belief.utils import noun_fluenterer
+
+with open('belief/templates.json', 'r') as f:
+    templates = json.load(f)
 
 WEIGHT_PRECISION = 3
 
@@ -65,10 +70,42 @@ class Proposition():
 
     def __repr__(self):
         return f"({self.sentence}, {self.boolean}, {self.weight / (10**WEIGHT_PRECISION)})"
-
+    
+    @classmethod
+    def from_sent(cls, sent, boolean=True):
+        subject, rel, obj = sent.split(',')
+        predicate = Predicate(rel + ',' + obj)
+        return cls(subject, predicate, boolean)
+    
     @property
     def sentence(self):
         return self.predicate.substitute(self.subject)
+    
+    def get_assertion(self, negated=False):
+        subj = noun_fluenterer(self.subject, relation=self.predicate.relation)
+        obj = noun_fluenterer(self.predicate.object, relation=self.predicate.relation)
+        
+        if not negated:
+            s = templates[self.predicate.relation]['assertion_positive']
+        else:
+            s = templates[self.predicate.relation]['assertion_negative']
+        s = s.replace('{X}', subj)
+        s = s.replace('{Y}', obj)
+        return s
+    
+    def get_question(self, negated=False):
+        subj = noun_fluenterer(self.subject, relation=self.predicate.relation)
+        obj = noun_fluenterer(self.predicate.object, relation=self.predicate.relation)
+        
+        if not negated:
+            s = random.choice(templates[self.predicate.relation]['templates'])
+        else:
+            s = random.choice(templates[self.predicate.relation]['templates_negated'])
+        
+        s = s.replace('{X}', subj)
+        s = s.replace('{Y}', obj)
+        return s
+        
 
     def get_nl_sentence(self):
         """Returns natural language sentence expressing the proposition"""
@@ -103,20 +140,20 @@ class Proposition():
             else:
                 return f"{self.subject} does not have the property of being {self.predicate.object}."
 
-    def get_nl_question(self):
-        """Returns natural language sentence asking the proposition"""
-        if self.predicate.relation == 'IsA':
-            return f"Is a {self.subject} a {self.predicate.object}?"
-        if self.predicate.relation == "MadeOf":
-            return f"Is a {self.subject} made of {self.predicate.object}?"
-        if self.predicate.relation == "CapableOf":
-            return f"Is a {self.subject} capable of {self.predicate.object}?"
-        if self.predicate.relation == "HasA":
-            return f"Does a {self.subject} have a {self.predicate.object}?"
-        if self.predicate.relation == "HasPart":
-            return f"Is a {self.predicate.object} part of a {self.subject}?"
-        if self.predicate.relation == "HasProperty":
-            return f"Does {self.subject} have the property of being {self.predicate.object}?"
+    # def get_nl_question(self):
+    #     """Returns natural language sentence asking the proposition"""
+    #     if self.predicate.relation == 'IsA':
+    #         return f"Is a {self.subject} a {self.predicate.object}?"
+    #     if self.predicate.relation == "MadeOf":
+    #         return f"Is a {self.subject} made of {self.predicate.object}?"
+    #     if self.predicate.relation == "CapableOf":
+    #         return f"Is a {self.subject} capable of {self.predicate.object}?"
+    #     if self.predicate.relation == "HasA":
+    #         return f"Does a {self.subject} have a {self.predicate.object}?"
+    #     if self.predicate.relation == "HasPart":
+    #         return f"Is a {self.predicate.object} part of a {self.subject}?"
+    #     if self.predicate.relation == "HasProperty":
+    #         return f"Does {self.subject} have the property of being {self.predicate.object}?"
 
 class Constraint():
     """Class for constraint
@@ -211,7 +248,8 @@ class LMBB():
         self.num_relevant_beliefs = 3
         
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.model.to(self.device)
+        if self.model is not None:
+            self.model.to(self.device)
         
         self.DEBUG = False
 
