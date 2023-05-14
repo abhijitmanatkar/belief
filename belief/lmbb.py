@@ -72,10 +72,10 @@ class Proposition():
         return f"({self.sentence}, {self.boolean}, {self.weight / (10**WEIGHT_PRECISION)})"
     
     @classmethod
-    def from_sent(cls, sent, boolean=True):
+    def from_sent(cls, sent, boolean=True, weight=-99999):
         subject, rel, obj = sent.split(',')
         predicate = Predicate(rel + ',' + obj)
-        return cls(subject, predicate, boolean)
+        return cls(subject, predicate, boolean, weight)
     
     @property
     def sentence(self):

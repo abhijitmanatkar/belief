@@ -15,6 +15,6 @@ def run_nli(premise, hypothesis, model, tokenizer):
 
     prediction = torch.softmax(output.logits[0], -1).tolist()
     label_names = ["entailment", "neutral", "contradiction"]
-    prediction = {name: round(float(pred) , 3) for pred, name in zip(prediction, label_names)}
+    prediction = {name: round(float(pred) , 4) for pred, name in zip(prediction, label_names)}
 
     return prediction
